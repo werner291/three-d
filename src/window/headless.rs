@@ -1,8 +1,11 @@
 use crate::{Context, CoreError};
-use glutin_029::{
-    dpi::PhysicalSize, event_loop::EventLoop, ContextBuilder, ContextCurrentState, CreationError,
-    NotCurrent, PossiblyCurrent,
-};
+use glutin::api::egl::context::PossiblyCurrentContext;
+use glutin::api::egl::device::Device;
+use glutin::api::egl::display::Display;
+use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder, GlConfig};
+use glutin::context::{ContextApi, ContextAttributesBuilder};
+use glutin::display::GlDisplay;
+use glutin::prelude::*;
 use std::rc::Rc;
 use thiserror::Error;
 
@@ -12,10 +15,6 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[allow(missing_docs)]
 pub enum HeadlessError {
-    #[error("glutin error")]
-    GlutinCreationError(#[from] glutin_029::CreationError),
-    #[error("glutin error")]
-    GlutinContextError(#[from] glutin_029::ContextError),
     #[error("error in three-d")]
     ThreeDError(#[from] CoreError),
 }
@@ -28,7 +27,7 @@ pub enum HeadlessError {
 #[derive(Clone)]
 pub struct HeadlessContext {
     context: Context,
-    _glutin_context: Rc<glutin_029::Context<PossiblyCurrent>>,
+    _glutin_context: Rc<PossiblyCurrentContext>,
 }
 
 impl HeadlessContext {
@@ -37,17 +36,85 @@ impl HeadlessContext {
     ///
     #[allow(unsafe_code)]
     pub fn new() -> Result<Self, HeadlessError> {
-        let cb = ContextBuilder::new();
-        let glutin_context = build_context(cb)?;
-        let glutin_context = unsafe { glutin_context.make_current().map_err(|(_, e)| e)? };
-        let context = Context::from_gl_context(std::sync::Arc::new(unsafe {
-            crate::context::Context::from_loader_function(|s| {
-                glutin_context.get_proc_address(s) as *const _
+        let devices = Device::query_devices()
+            .expect("Failed to query devices")
+            .collect::<Vec<_>>();
+
+        for (index, device) in devices.iter().enumerate() {
+            println!(
+                "Device {}: Name: {} Vendor: {}",
+                index,
+                device.name().unwrap_or("UNKNOWN"),
+                device.vendor().unwrap_or("UNKNOWN")
+            );
+        }
+
+        let device = devices.first().expect("No available devices");
+
+        // Create a display using the device.
+        let display = unsafe {
+            // Safety: unsafe condition only triggered by raw_display being Some.
+            Display::with_device(device, None)
+        }
+        .expect("Failed to create display");
+
+        let template = ConfigTemplateBuilder::default()
+            .with_alpha_size(8)
+            // Offscreen rendering has no support window surface support.
+            .with_surface_type(ConfigSurfaceTypes::empty())
+            .build();
+
+        let config = unsafe {
+            // TODO: Argue safety?
+            display.find_configs(template)
+        }
+        .unwrap()
+        .reduce(|config, acc| {
+            if config.num_samples() > acc.num_samples() {
+                config
+            } else {
+                acc
+            }
+        })
+        .expect("No available configs");
+
+        println!("Picked a config with {} samples", config.num_samples());
+
+        // Context creation.
+        //
+        // In particular, since we are doing offscreen rendering we have no raw window
+        // handle to provide.
+        let context_attributes = ContextAttributesBuilder::new().build(None);
+
+        // Since glutin by default tries to create OpenGL core context, which may not be
+        // present we should try gles.
+        let fallback_context_attributes = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::Gles(None))
+            .build(None);
+
+        let not_current = unsafe {
+            display
+                .create_context(&config, &context_attributes)
+                .unwrap_or_else(|_| {
+                    display
+                        .create_context(&config, &fallback_context_attributes)
+                        .expect("failed to create context")
+                })
+        };
+
+        let current = not_current.make_current_surfaceless().unwrap();
+
+        let glow_context = unsafe {
+            glow::Context::from_loader_function_cstr(|name| {
+                display.get_proc_address(name) as *const _
             })
-        }))?;
+        };
+
+        let context = Context::from_gl_context(glow_context.into()).expect("TODO: panic message");
+
         Ok(Self {
             context,
-            _glutin_context: Rc::new(glutin_context),
+            _glutin_context: Rc::new(current),
         })
     }
 }
@@ -57,71 +124,4 @@ impl std::ops::Deref for HeadlessContext {
     fn deref(&self) -> &Self::Target {
         &self.context
     }
-}
-
-/*#[cfg(target_os = "linux")]
-fn build_context_surfaceless<T1: ContextCurrentState>(
-    cb: ContextBuilder<T1>,
-    el: &EventLoop<()>,
-) -> Result<glutin_029::Context<NotCurrent>, CreationError> {
-    use glutin_029::platform::unix::HeadlessContextExt;
-    cb.build_surfaceless(&el)
-}*/
-
-fn build_context_headless<T1: ContextCurrentState>(
-    cb: ContextBuilder<T1>,
-    el: &EventLoop<()>,
-) -> Result<glutin_029::Context<NotCurrent>, CreationError> {
-    let size_one = PhysicalSize::new(1, 1);
-    cb.build_headless(el, size_one)
-}
-
-#[cfg(target_os = "linux")]
-fn build_context_osmesa<T1: ContextCurrentState>(
-    cb: ContextBuilder<T1>,
-) -> Result<glutin_029::Context<NotCurrent>, CreationError> {
-    use glutin_029::platform::unix::HeadlessContextExt;
-    let size_one = PhysicalSize::new(1, 1);
-    cb.build_osmesa(size_one)
-}
-
-#[cfg(target_os = "linux")]
-fn build_context<T1: ContextCurrentState>(
-    cb: ContextBuilder<T1>,
-) -> Result<glutin_029::Context<NotCurrent>, CreationError> {
-    // On unix operating systems, you should always try for surfaceless first,
-    // and if that does not work, headless (pbuffers), and if that too fails,
-    // finally osmesa.
-    //
-    // If willing, you could attempt to use hidden windows instead of os mesa,
-    // but note that you must handle events for the window that come on the
-    // events loop.
-
-    /*
-    let err1 = match build_context_surfaceless(cb.clone(), &el) {
-        Ok(ctx) => return Ok((ctx, el)),
-        Err(err) => err,
-    };*/
-
-    let _err3 = match build_context_osmesa(cb.clone()) {
-        Ok(ctx) => return Ok(ctx),
-        Err(err) => err,
-    };
-
-    let el = EventLoop::new();
-
-    let err2 = match build_context_headless(cb, &el) {
-        Ok(ctx) => return Ok(ctx),
-        Err(err) => err,
-    };
-
-    Err(err2)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn build_context<T1: ContextCurrentState>(
-    cb: ContextBuilder<T1>,
-) -> Result<glutin_029::Context<NotCurrent>, CreationError> {
-    let el = EventLoop::new();
-    build_context_headless(cb.clone(), &el)
 }
