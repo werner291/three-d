@@ -20,6 +20,7 @@ pub struct InstancedMesh {
     instance_color: RwLock<Option<InstanceBuffer<Vec4>>>,
     last_camera_position: RwLock<Option<Vec3>>,
     aabb: AxisAlignedBoundingBox, // The AABB for the base mesh without transformations applied
+    cached_instances_aabb: RwLock<Option<AxisAlignedBoundingBox>>, // Cached AABB for all instances combined
     transformation: Mat4,
     animation_transformation: Mat4,
     animation: Option<Box<dyn Fn(f32) -> Mat4 + Send + Sync>>,
@@ -50,6 +51,7 @@ impl InstancedMesh {
             last_camera_position: RwLock::new(None),
             indices: RwLock::new((0..instances.transformations.len()).collect::<Vec<usize>>()),
             aabb,
+            cached_instances_aabb: RwLock::new(None),
             transformation: Mat4::identity(),
             animation_transformation: Mat4::identity(),
             animation: None,
@@ -73,6 +75,7 @@ impl InstancedMesh {
     pub fn set_transformation(&mut self, transformation: Mat4) {
         self.transformation = transformation;
         *self.last_camera_position.write().unwrap() = None;
+        *self.cached_instances_aabb.write().unwrap() = None;
     }
 
     ///
@@ -100,6 +103,7 @@ impl InstancedMesh {
         *self.indices.write().unwrap() =
             (0..instances.transformations.len()).collect::<Vec<usize>>();
         *self.last_camera_position.write().unwrap() = None;
+        *self.cached_instances_aabb.write().unwrap() = None;
 
         self.update_instance_buffers();
     }
@@ -254,12 +258,21 @@ impl Geometry for InstancedMesh {
     }
 
     fn aabb(&self) -> AxisAlignedBoundingBox {
+        // Return cached AABB if available
+        if let Some(cached) = *self.cached_instances_aabb.read().unwrap() {
+            return cached;
+        }
+
+        // Compute AABB from all instances
         let mut aabb = AxisAlignedBoundingBox::EMPTY;
         for instance_transformation in &self.instances.transformations {
             aabb.expand_with_aabb(self.aabb.transformed(
                 self.transformation * instance_transformation * self.animation_transformation,
             ));
         }
+
+        // Cache the result
+        *self.cached_instances_aabb.write().unwrap() = Some(aabb);
         aabb
     }
 
@@ -267,6 +280,7 @@ impl Geometry for InstancedMesh {
         if let Some(animation) = &self.animation {
             self.animation_transformation = animation(time);
             *self.last_camera_position.write().unwrap() = None;
+            *self.cached_instances_aabb.write().unwrap() = None;
         }
     }
 
